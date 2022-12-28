@@ -13,9 +13,13 @@ class MQ():
         except Exception as e:
             print(e)
 
-    def producer(self, activity, user_id, params, unique = False):
+    def producer(self, topic, activity, user_id, params, unique = False):
+        ''' Interface for the producer to send messages to the queue
+            Sequence:topic, activity '''
+        # Issue: #1
         message: dict = {}
         message = {
+            'topic': topic,
             'activity': activity,
             'user_id': user_id,
             'params': params
@@ -35,17 +39,18 @@ class MQ():
         try:
             result = self.mongo_db['smartez']['MQ']
             for message in result.find():
-                if message['activity'] == topic:
+                if message['topic'] == topic:
                     if delete:
                         self.delete_mq(message)
                     return message
+            return None
         except Exception as e:
             logger.log_to_console(
                     'INFO', 'MQ::consumer', 'error consuming message:{}'.format(e))
 
     def delete_mq(self, message):
         try:
-            result = self.mongo_db['smartez']['MQ'].delete_one({'_id':message['_id']})
+            self.mongo_db['smartez']['MQ'].delete_one({'_id':message['_id']})
             logger.log_to_console(
                     'INFO', 'MQ::delete_mq', 'handled message succesfully:{}'.format(message))
             return True
