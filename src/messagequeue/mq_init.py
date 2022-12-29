@@ -9,9 +9,9 @@ if __name__ == "__main__":
         logger.log_to_console(
             'INFO', 'mq_init', 'Initializing message queue')
         mq = MQ()
-        mq.producer('test', 'test', 'test')
+        mq.producer('test', 'test', 'test','test')
         while True:
-            mq.consumer('test', True)
+            message = mq.consumer('test', True)
             time.sleep(1)
     except Exception as e:
         print(e)

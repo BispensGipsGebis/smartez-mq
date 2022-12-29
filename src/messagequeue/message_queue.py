@@ -33,16 +33,23 @@ class MQ():
             message)
         return message
 
-    def consumer(self, topic, delete = False):
+    def consumer(self, topic, delete = False, all = False):
         ''' Interface for the consumer to get messages from the queue
          '''
         try:
             result = self.mongo_db['smartez']['MQ']
+            messages = []
             for message in result.find():
-                if message['topic'] == topic:
-                    if delete:
-                        self.delete_mq(message)
-                    return message
+                if message.get('topic'):
+                    if message['topic'] == topic:
+                        if delete:
+                            self.delete_mq(message)
+                        if not all:
+                            return message
+                        else:
+                            messages.append(message)
+            if len(messages) > 0:
+                return messages
             return None
         except Exception as e:
             logger.log_to_console(
