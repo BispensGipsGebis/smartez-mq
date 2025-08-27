@@ -33,7 +33,7 @@ class MQ():
             message)
         return message
 
-    def consumer(self, topic, delete = False, all = False):
+    def consumer(self, topic, delete=False, all=False):
         ''' Interface for the consumer to get messages from the queue
          '''
         try:
@@ -53,7 +53,7 @@ class MQ():
             return None
         except Exception as e:
             logger.log_to_console(
-                    'INFO', 'MQ::consumer', 'error consuming message:{}'.format(e))
+                    'ERROR', 'MQ::consumer', 'error consuming message:{}'.format(e))
 
     def delete_mq(self, message):
         try:
@@ -63,6 +63,6 @@ class MQ():
             return True
         except Exception as e:
             logger.log_to_console(
-                    'INFO', 'MQ::delete_mq', 'error deleting message:{}'.format(e))
+                    'ERROR', 'MQ::delete_mq', 'error deleting message:{}, with error: {}'.format(message,e))
 
 
