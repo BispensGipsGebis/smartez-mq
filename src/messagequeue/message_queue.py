@@ -6,12 +6,22 @@ from smartezlogger import logger
 @dataclass
 class MQ():
     def __init__(self):
+        self.mongo_db = None
+        self._mongo_error = None
         try:
             client = pymongo.MongoClient(
                 os.environ["MONGODB_URL"])
             self.mongo_db = client
         except Exception as e:
-            print(e)
+            self._mongo_error = e
+            logger.log_to_console('ERROR', 'MQ::__init__', f'failed to initialize MongoDB client: {e}')
+
+    def _mq_collection(self):
+        if self.mongo_db is None:
+            if self._mongo_error is not None:
+                raise RuntimeError(f'MongoDB client is not initialized: {self._mongo_error}')
+            raise RuntimeError('MongoDB client is not initialized')
+        return self.mongo_db['smartez']['MQ']
 
     def producer(self, topic, activity, user_id, params, unique = False):
         ''' Interface for the producer to send messages to the queue
@@ -25,11 +35,11 @@ class MQ():
             'params': params
         }
         if unique:
-            result = self.mongo_db['smartez']['MQ'].find_one({'activity':activity, 'user_id':user_id, 'params':params} )
+            result = self._mq_collection().find_one({'activity':activity, 'user_id':user_id, 'params':params} )
             if result:
                 return True
         # saving to mongo
-        result = self.mongo_db['smartez']['MQ'].insert_one(
+        result = self._mq_collection().insert_one(
             message)
         return message
 
@@ -37,7 +47,7 @@ class MQ():
         ''' Interface for the consumer to get messages from the queue
          '''
         try:
-            result = self.mongo_db['smartez']['MQ']
+            result = self._mq_collection()
             messages = []
             for message in result.find():
                 if message.get('topic'):
@@ -57,7 +67,7 @@ class MQ():
 
     def delete_mq(self, message):
         try:
-            self.mongo_db['smartez']['MQ'].delete_one({'_id':message['_id']})
+            self._mq_collection().delete_one({'_id':message['_id']})
             logger.log_to_console(
                     'INFO', 'MQ::delete_mq', 'handled message succesfully:{}'.format(message))
             return True
