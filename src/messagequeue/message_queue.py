@@ -13,16 +13,51 @@ class MQ():
         self._canonical_collection_name = os.getenv('MQ_CANONICAL_COLLECTION', 'MQ')
         self._shard_db_prefix = os.getenv('MQ_SHARD_DB_PREFIX', 'smartez_mq_')
         self._shard_collection_name = os.getenv('MQ_SHARD_COLLECTION', 'MQ')
+        self._topic_override_db_name = os.getenv('MQ_TOPIC_OVERRIDE_DB', 'smartez_mq')
+        self._topic_override_collection_prefix = os.getenv('MQ_TOPIC_OVERRIDE_COLLECTION_PREFIX', 'MQ_')
+        raw_topic_overrides = os.getenv('MQ_TOPIC_OVERRIDES', 'categorize')
+        self._topic_overrides = {
+            str(topic).strip().lower()
+            for topic in str(raw_topic_overrides).split(',')
+            if str(topic).strip()
+        }
+        raw_topic_route_map = os.getenv('MQ_TOPIC_ROUTE_MAP', 'categorize=smartez_mq.MQ_categorize')
+        self._topic_route_map = self._parse_topic_route_map(raw_topic_route_map)
+        self._route_logs = set()
         self._secretary_checkpoint_collection = os.getenv('MQ_SECRETARY_CHECKPOINT_COLLECTION', 'MQSecretaryCheckpoint')
         self._secretary_checkpoint_key = os.getenv('MQ_SECRETARY_CHECKPOINT_KEY', 'fanout')
         try:
+            mongo_url = os.getenv('MONGODB_URL') or os.getenv('MONGO_URI')
+            if not mongo_url:
+                raise RuntimeError('Missing MongoDB connection string. Set MONGODB_URL or MONGO_URI')
             client = pymongo.MongoClient(
-                os.environ["MONGODB_URL"])
+                mongo_url)
             self.mongo_db = client
             self._ensure_indexes()
         except Exception as e:
             self._mongo_error = e
             logger.log_to_console('ERROR', 'MQ::__init__', f'failed to initialize MongoDB client: {e}')
+
+    def _parse_topic_route_map(self, raw_value):
+        route_map = {}
+        if raw_value is None:
+            return route_map
+
+        for part in str(raw_value).split(','):
+            entry = str(part).strip()
+            if not entry or '=' not in entry:
+                continue
+            topic_key, collection_target = entry.split('=', 1)
+            topic_value = self._sanitize_topic(topic_key)
+            target = str(collection_target).strip()
+            if not topic_value or '.' not in target:
+                continue
+            db_name, collection_name = target.split('.', 1)
+            db_name = str(db_name).strip()
+            collection_name = str(collection_name).strip()
+            if db_name and collection_name:
+                route_map[topic_value] = (db_name, collection_name)
+        return route_map
 
     def _mq_collection(self):
         if self.mongo_db is None:
@@ -55,6 +90,30 @@ class MQ():
         db_name = f"{self._shard_db_prefix}{topic_safe}"
         return self.mongo_db[db_name][self._shard_collection_name]
 
+    def _topic_override_collection(self, topic):
+        topic_safe = self._sanitize_topic(topic)
+        mapped_target = self._topic_route_map.get(topic_safe)
+        if mapped_target is not None:
+            db_name, collection_name = mapped_target
+            return self.mongo_db[db_name][collection_name]
+        if topic_safe not in self._topic_overrides:
+            return None
+        collection_name = f"{self._topic_override_collection_prefix}{topic_safe}"
+        return self.mongo_db[self._topic_override_db_name][collection_name]
+
+    def _route_message(self, topic, collection):
+        try:
+            route_key = f"{topic}:{collection.full_name}"
+            if route_key not in self._route_logs:
+                self._route_logs.add(route_key)
+                logger.log_to_console(
+                    'INFO',
+                    'MQ::route',
+                    'topic={} collection={}'.format(topic, collection.full_name)
+                )
+        except Exception:
+            pass
+
     def _ensure_collection_indexes(self, collection):
         collection.create_index([('topic', 1), ('_id', 1)])
         collection.create_index([('topic', 1), ('activity', 1), ('_id', 1)])
@@ -64,6 +123,13 @@ class MQ():
         try:
             collection = self._mq_collection()
             self._ensure_collection_indexes(collection)
+            route_topics = set(self._topic_overrides)
+            for topic in self._topic_route_map.keys():
+                route_topics.add(topic)
+            for topic in route_topics:
+                override_collection = self._topic_override_collection(topic)
+                if override_collection is not None:
+                    self._ensure_collection_indexes(override_collection)
             self._checkpoint_collection().create_index([('_id', 1)], unique=True)
         except Exception as e:
             logger.log_to_console('WARNING', 'MQ::_ensure_indexes', 'failed to ensure MQ indexes: {}'.format(e))
@@ -75,6 +141,17 @@ class MQ():
         return query
 
     def _find_one_with_fallback(self, topic, query):
+        override_collection = self._topic_override_collection(topic)
+        if override_collection is not None:
+            try:
+                self._ensure_collection_indexes(override_collection)
+            except Exception:
+                pass
+            self._route_message(topic, override_collection)
+            message = override_collection.find_one(query, sort=[('_id', pymongo.ASCENDING)])
+            if message is not None:
+                return message
+
         shard_collection = self._topic_collection(topic)
         try:
             self._ensure_collection_indexes(shard_collection)
@@ -87,21 +164,38 @@ class MQ():
         return self._mq_collection().find_one(query, sort=[('_id', pymongo.ASCENDING)])
 
     def _find_many_with_fallback(self, topic, query, limit=None):
+        override_collection = self._topic_override_collection(topic)
+        if override_collection is not None:
+            try:
+                self._ensure_collection_indexes(override_collection)
+            except Exception:
+                pass
+
         shard_collection = self._topic_collection(topic)
         try:
             self._ensure_collection_indexes(shard_collection)
         except Exception:
             pass
 
-        cursor = shard_collection.find(query).sort('_id', pymongo.ASCENDING)
         parsed_limit = None
         if limit is not None:
             try:
                 parsed_limit = int(limit)
             except Exception:
                 parsed_limit = None
+
+        if override_collection is not None:
+            self._route_message(topic, override_collection)
+            override_cursor = override_collection.find(query).sort('_id', pymongo.ASCENDING)
             if parsed_limit is not None and parsed_limit > 0:
-                cursor = cursor.limit(parsed_limit)
+                override_cursor = override_cursor.limit(parsed_limit)
+            override_messages = list(override_cursor)
+            if override_messages:
+                return override_messages
+
+        cursor = shard_collection.find(query).sort('_id', pymongo.ASCENDING)
+        if parsed_limit is not None and parsed_limit > 0:
+            cursor = cursor.limit(parsed_limit)
         messages = list(cursor)
         if messages:
             return messages
@@ -122,12 +216,22 @@ class MQ():
             'user_id': user_id,
             'params': params
         }
+        write_collection = self._topic_override_collection(topic)
+        if write_collection is None:
+            write_collection = self._mq_collection()
+        else:
+            self._route_message(topic, write_collection)
+
         if unique:
-            result = self._mq_collection().find_one({'activity':activity, 'user_id':user_id, 'params':params} )
+            result = write_collection.find_one({'activity':activity, 'user_id':user_id, 'params':params} )
+            if result:
+                return True
+            if write_collection != self._mq_collection():
+                result = self._mq_collection().find_one({'activity':activity, 'user_id':user_id, 'params':params} )
             if result:
                 return True
         # saving to mongo
-        result = self._mq_collection().insert_one(
+        result = write_collection.insert_one(
             message)
         return message
 
@@ -214,6 +318,10 @@ class MQ():
             if delete and messages:
                 ids = [message['_id'] for message in messages if message and '_id' in message]
                 if ids:
+                    override_collection = self._topic_override_collection(topic)
+                    if override_collection is not None:
+                        self._route_message(topic, override_collection)
+                        override_collection.delete_many({'_id': {'$in': ids}})
                     self._mq_collection().delete_many({'_id': {'$in': ids}})
                     try:
                         self._topic_collection(topic).delete_many({'_id': {'$in': ids}})
@@ -227,7 +335,11 @@ class MQ():
 
     def delete_invalid_activity_messages(self, topic, batch_size=200):
         try:
-            collection = self._mq_collection()
+            collection = self._topic_override_collection(topic)
+            if collection is None:
+                collection = self._mq_collection()
+            else:
+                self._route_message(topic, collection)
             size = 200
             try:
                 size = int(batch_size)
@@ -267,6 +379,11 @@ class MQ():
                 return False
 
             self._mq_collection().delete_one({'_id': message_id})
+            if message_topic is not None:
+                override_collection = self._topic_override_collection(message_topic)
+                if override_collection is not None:
+                    self._route_message(message_topic, override_collection)
+                    override_collection.delete_one({'_id': message_id})
             if message_topic is not None:
                 try:
                     self._topic_collection(message_topic).delete_one({'_id': message_id})
