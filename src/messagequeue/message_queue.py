@@ -3,7 +3,7 @@ import pymongo
 import os
 import time
 from datetime import datetime
-from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError
+from pymongo.errors import AutoReconnect, ConfigurationError, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError
 from smartezlogger import logger
 
 @dataclass
@@ -27,6 +27,9 @@ class MQ():
         raw_topic_route_map = os.getenv('MQ_TOPIC_ROUTE_MAP', 'categorize=smartez_mq.MQ_categorize')
         self._topic_route_map = self._parse_topic_route_map(raw_topic_route_map)
         self._route_logs = set()
+        self._availability_log_cooldown_seconds = float(os.getenv('MQ_UNAVAILABLE_LOG_COOLDOWN_SECONDS', '30'))
+        self._last_unavailable_log_at = 0.0
+        self._last_unavailable_log_message = None
         self._secretary_checkpoint_collection = os.getenv('MQ_SECRETARY_CHECKPOINT_COLLECTION', 'MQSecretaryCheckpoint')
         self._secretary_checkpoint_key = os.getenv('MQ_SECRETARY_CHECKPOINT_KEY', 'fanout')
         try:
@@ -53,15 +56,62 @@ class MQ():
         return max(0.0, delay)
 
     def _is_retryable_mongo_error(self, error):
-        return isinstance(error, (AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError))
+        if isinstance(error, (AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError)):
+            return True
+        if isinstance(error, ConfigurationError):
+            error_message = str(error).lower()
+            return 'resolution lifetime expired' in error_message or 'dns' in error_message or 'srv' in error_message
+        return False
+
+    def _mongo_connect_timeout_ms(self):
+        try:
+            value = int(os.getenv('MQ_MONGO_CONNECT_TIMEOUT_MS', '5000'))
+        except Exception:
+            value = 5000
+        return max(1000, value)
+
+    def _mongo_server_selection_timeout_ms(self):
+        try:
+            value = int(os.getenv('MQ_MONGO_SERVER_SELECTION_TIMEOUT_MS', '5000'))
+        except Exception:
+            value = 5000
+        return max(1000, value)
+
+    def _log_unavailable_once(self, operation_name, error):
+        now = time.monotonic()
+        message = '{}: {}'.format(operation_name, error)
+        if (
+            self._last_unavailable_log_message == message and
+            (now - self._last_unavailable_log_at) < self._availability_log_cooldown_seconds
+        ):
+            return
+        self._last_unavailable_log_at = now
+        self._last_unavailable_log_message = message
+        logger.log_to_console('ERROR', 'MQ::unavailable', message)
+
+    def _require_mongo_client(self):
+        if self.mongo_db is None:
+            if self._mongo_error is not None:
+                raise RuntimeError(f'MongoDB client is not initialized: {self._mongo_error}')
+            raise RuntimeError('MongoDB client is not initialized')
+        return self.mongo_db
 
     def _build_client(self):
-        return pymongo.MongoClient(self._mongo_url)
+        return pymongo.MongoClient(
+            self._mongo_url,
+            connectTimeoutMS=self._mongo_connect_timeout_ms(),
+            serverSelectionTimeoutMS=self._mongo_server_selection_timeout_ms(),
+        )
+
+    def _probe_client(self, client):
+        client.admin.command('ping')
+        return client
 
     def _connect_client(self):
         if not self._mongo_url:
             raise RuntimeError('Missing MongoDB connection string. Set MONGODB_URL or MONGO_URI')
         client = self._build_client()
+        self._probe_client(client)
         self.mongo_db = client
         self._mongo_error = None
         self._ensure_indexes()
@@ -133,18 +183,12 @@ class MQ():
         return route_map
 
     def _mq_collection(self):
-        if self.mongo_db is None:
-            if self._mongo_error is not None:
-                raise RuntimeError(f'MongoDB client is not initialized: {self._mongo_error}')
-            raise RuntimeError('MongoDB client is not initialized')
-        return self.mongo_db[self._canonical_db_name][self._canonical_collection_name]
+        mongo_db = self._require_mongo_client()
+        return mongo_db[self._canonical_db_name][self._canonical_collection_name]
 
     def _checkpoint_collection(self):
-        if self.mongo_db is None:
-            if self._mongo_error is not None:
-                raise RuntimeError(f'MongoDB client is not initialized: {self._mongo_error}')
-            raise RuntimeError('MongoDB client is not initialized')
-        return self.mongo_db[self._canonical_db_name][self._secretary_checkpoint_collection]
+        mongo_db = self._require_mongo_client()
+        return mongo_db[self._canonical_db_name][self._secretary_checkpoint_collection]
 
     def _sanitize_topic(self, topic):
         value = str(topic or '').strip().lower()
@@ -161,18 +205,20 @@ class MQ():
     def _topic_collection(self, topic):
         topic_safe = self._sanitize_topic(topic)
         db_name = f"{self._shard_db_prefix}{topic_safe}"
-        return self.mongo_db[db_name][self._shard_collection_name]
+        mongo_db = self._require_mongo_client()
+        return mongo_db[db_name][self._shard_collection_name]
 
     def _topic_override_collection(self, topic):
         topic_safe = self._sanitize_topic(topic)
+        mongo_db = self._require_mongo_client()
         mapped_target = self._topic_route_map.get(topic_safe)
         if mapped_target is not None:
             db_name, collection_name = mapped_target
-            return self.mongo_db[db_name][collection_name]
+            return mongo_db[db_name][collection_name]
         if topic_safe not in self._topic_overrides:
             return None
         collection_name = f"{self._topic_override_collection_prefix}{topic_safe}"
-        return self.mongo_db[self._topic_override_db_name][collection_name]
+        return mongo_db[self._topic_override_db_name][collection_name]
 
     def _is_strict_routed_topic(self, topic):
         topic_safe = self._sanitize_topic(topic)
@@ -314,7 +360,11 @@ class MQ():
             write_collection.insert_one(message)
             return message
 
-        return self.execute_with_retry('producer', operation)
+        try:
+            return self.execute_with_retry('producer', operation)
+        except Exception as e:
+            self._log_unavailable_once('producer', e)
+            return None
 
     def secretary_fanout_once(self, batch_size=500, topic=None):
         try:
@@ -380,7 +430,7 @@ class MQ():
 
             return self.execute_with_retry('secretary_fanout_once', operation)
         except Exception as e:
-            logger.log_to_console('ERROR', 'MQ::secretary_fanout_once', 'error during fanout: {}'.format(e))
+            self._log_unavailable_once('secretary_fanout_once', e)
             return {
                 'processed': 0,
                 'last_id': None,
@@ -418,8 +468,8 @@ class MQ():
 
             return self.execute_with_retry('consumer', operation)
         except Exception as e:
-            logger.log_to_console(
-                    'ERROR', 'MQ::consumer', 'error consuming message:{}'.format(e))
+            self._log_unavailable_once('consumer', e)
+            return None
 
     def delete_invalid_activity_messages(self, topic, batch_size=200):
         try:
@@ -457,10 +507,7 @@ class MQ():
 
             return self.execute_with_retry('delete_invalid_activity_messages', operation)
         except Exception as e:
-            logger.log_to_console(
-                'ERROR', 'MQ::delete_invalid_activity_messages',
-                'error deleting invalid activity messages:{}'.format(e)
-            )
+            self._log_unavailable_once('delete_invalid_activity_messages', e)
             return 0
 
     def delete_mq(self, message):
@@ -493,7 +540,7 @@ class MQ():
 
             return self.execute_with_retry('delete_mq', operation)
         except Exception as e:
-            logger.log_to_console(
-                    'ERROR', 'MQ::delete_mq', 'error deleting message:{}, with error: {}'.format(message,e))
+            self._log_unavailable_once('delete_mq', e)
+            return False
 
 
