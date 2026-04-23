@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="smartez-mq",
-    version="0.0.8",
+    version="0.0.12",
     author="Rune Lykke-Kjeldsen",
     author_email="rune@lykke-kjeldsen.dk",
     description="Simple message queue package used for smartez",
