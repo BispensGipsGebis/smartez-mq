@@ -3,6 +3,8 @@ import pymongo
 import os
 import time
 from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import dns.resolver
 from pymongo.errors import AutoReconnect, ConfigurationError, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError
 from smartezlogger import logger
 
@@ -12,6 +14,7 @@ class MQ():
         self.mongo_db = None
         self._mongo_error = None
         self._mongo_url = None
+        self._mongo_url_override = None
         self._canonical_db_name = os.getenv('MQ_CANONICAL_DB', 'smartez')
         self._canonical_collection_name = os.getenv('MQ_CANONICAL_COLLECTION', 'MQ')
         self._shard_db_prefix = os.getenv('MQ_SHARD_DB_PREFIX', 'smartez_mq_')
@@ -72,10 +75,94 @@ class MQ():
 
     def _mongo_server_selection_timeout_ms(self):
         try:
-            value = int(os.getenv('MQ_MONGO_SERVER_SELECTION_TIMEOUT_MS', '5000'))
+            value = int(os.getenv('MQ_MONGO_SERVER_SELECTION_TIMEOUT_MS', '15000'))
         except Exception:
-            value = 5000
+            value = 15000
         return max(1000, value)
+
+    def _mongo_dns_timeout_seconds(self):
+        try:
+            value = float(os.getenv('MQ_MONGO_DNS_TIMEOUT_SECONDS', '2.0'))
+        except Exception:
+            value = 2.0
+        return max(0.5, value)
+
+    def _mongo_dns_lifetime_seconds(self):
+        try:
+            value = float(os.getenv('MQ_MONGO_DNS_LIFETIME_SECONDS', '6.0'))
+        except Exception:
+            value = 6.0
+        return max(self._mongo_dns_timeout_seconds(), value)
+
+    def _mongo_dns_nameservers(self):
+        raw_value = os.getenv('MQ_MONGO_DNS_NAMESERVERS', '1.1.1.1,8.8.8.8')
+        values = [value.strip() for value in str(raw_value).split(',') if str(value).strip()]
+        return values or ['1.1.1.1', '8.8.8.8']
+
+    def _effective_mongo_url(self):
+        return self._mongo_url_override or self._mongo_url
+
+    def _is_dns_resolution_error(self, error):
+        error_message = str(error).lower()
+        return (
+            'resolution lifetime expired' in error_message or
+            'dns operation timed out' in error_message or
+            'temporary failure in name resolution' in error_message or
+            'no nameservers' in error_message or
+            'dns' in error_message or
+            'srv' in error_message
+        )
+
+    def _build_srv_fallback_mongo_url(self, mongo_url):
+        parsed = urlsplit(str(mongo_url or ''))
+        if parsed.scheme != 'mongodb+srv' or not parsed.hostname:
+            return None
+
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = self._mongo_dns_nameservers()
+        resolver.timeout = self._mongo_dns_timeout_seconds()
+        resolver.lifetime = self._mongo_dns_lifetime_seconds()
+
+        srv_records = resolver.resolve(f'_mongodb._tcp.{parsed.hostname}', 'SRV')
+        hosts = []
+        for record in srv_records:
+            host = str(record.target).rstrip('.')
+            port = int(record.port)
+            host_entry = f'{host}:{port}'
+            if host_entry not in hosts:
+                hosts.append(host_entry)
+
+        if not hosts:
+            return None
+
+        txt_options = {}
+        try:
+            txt_records = resolver.resolve(parsed.hostname, 'TXT')
+            for record in txt_records:
+                txt_value = ''.join(
+                    chunk.decode() if isinstance(chunk, bytes) else str(chunk)
+                    for chunk in getattr(record, 'strings', [])
+                )
+                for key, value in parse_qsl(txt_value, keep_blank_values=True):
+                    txt_options.setdefault(key, value)
+        except Exception:
+            pass
+
+        merged_options = dict(txt_options)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            merged_options[key] = value
+
+        query_string = urlencode(list(merged_options.items()))
+        auth_prefix = ''
+        if '@' in parsed.netloc:
+            auth_prefix = parsed.netloc.rsplit('@', 1)[0] + '@'
+        return urlunsplit((
+            'mongodb',
+            f"{auth_prefix}{','.join(hosts)}",
+            parsed.path,
+            query_string,
+            parsed.fragment,
+        ))
 
     def _log_unavailable_once(self, operation_name, error):
         now = time.monotonic()
@@ -98,7 +185,7 @@ class MQ():
 
     def _build_client(self):
         return pymongo.MongoClient(
-            self._mongo_url,
+            self._effective_mongo_url(),
             connectTimeoutMS=self._mongo_connect_timeout_ms(),
             serverSelectionTimeoutMS=self._mongo_server_selection_timeout_ms(),
         )
@@ -110,12 +197,71 @@ class MQ():
     def _connect_client(self):
         if not self._mongo_url:
             raise RuntimeError('Missing MongoDB connection string. Set MONGODB_URL or MONGO_URI')
-        client = self._build_client()
-        self._probe_client(client)
-        self.mongo_db = client
-        self._mongo_error = None
-        self._ensure_indexes()
-        return client
+        attempts = self._mongo_retry_attempts()
+        delay = self._mongo_retry_sleep_seconds()
+        last_error = None
+
+        for attempt in range(1, attempts + 1):
+            client = None
+            try:
+                client = self._build_client()
+                self._probe_client(client)
+                self.mongo_db = client
+                self._mongo_error = None
+                self._ensure_indexes()
+                return client
+            except Exception as error:
+                fallback_error = None
+                if self._is_dns_resolution_error(error):
+                    try:
+                        fallback_url = self._build_srv_fallback_mongo_url(self._mongo_url)
+                        if fallback_url and fallback_url != self._effective_mongo_url():
+                            logger.log_to_console(
+                                'WARNING',
+                                'MQ::_connect_client',
+                                'system DNS failed for Mongo SRV lookup, retrying with fallback resolvers'
+                            )
+                            fallback_client = None
+                            try:
+                                self._mongo_url_override = fallback_url
+                                fallback_client = self._build_client()
+                                self._probe_client(fallback_client)
+                                self.mongo_db = fallback_client
+                                self._mongo_error = None
+                                self._ensure_indexes()
+                                return fallback_client
+                            except Exception as resolved_error:
+                                fallback_error = resolved_error
+                                try:
+                                    fallback_client.close()
+                                except Exception:
+                                    pass
+                                self._mongo_url_override = None
+                    except Exception as resolve_error:
+                        fallback_error = resolve_error
+
+                if fallback_error is not None:
+                    error = fallback_error
+                last_error = error
+                self._mongo_error = error
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                if not self._is_retryable_mongo_error(error) or attempt >= attempts:
+                    break
+                logger.log_to_console(
+                    'WARNING',
+                    'MQ::_connect_client',
+                    'attempt={}/{} failed: {}'.format(attempt, attempts, error)
+                )
+                if delay > 0:
+                    time.sleep(delay * attempt)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError('MongoDB client initialization failed')
 
     def reconnect(self):
         old_client = self.mongo_db
